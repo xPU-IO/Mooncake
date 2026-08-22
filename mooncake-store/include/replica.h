@@ -217,6 +217,12 @@ struct LocalDiskReplicaData {
     UUID client_id;
     uint64_t object_size = 0;
     std::string transport_endpoint;
+    // Phoenix direct-read passthrough: record start offset within the data
+    // file (-1 = unknown) and the file's absolute path (empty = unknown).
+    // Filled from the offload-complete metadata; when absent, readers fall
+    // back to the owner RPC path.
+    int64_t record_offset = -1;
+    std::string file_path;
 };
 
 struct DistributedFSDescriptor {
@@ -253,7 +259,11 @@ struct LocalDiskDescriptor {
     UUID client_id;
     uint64_t object_size = 0;
     std::string transport_endpoint;
-    YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint);
+    // Phoenix direct-read passthrough (see LocalDiskReplicaData).
+    int64_t record_offset = -1;
+    std::string file_path;
+    YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint,
+             record_offset, file_path);
 };
 
 class Replica {
@@ -292,10 +302,12 @@ class Replica {
 
     // local disk replica constructor
     Replica(UUID client_id, uint64_t object_size,
-            std::string transport_endpoint, ReplicaStatus status)
+            std::string transport_endpoint, ReplicaStatus status,
+            int64_t record_offset = -1, std::string file_path = {})
         : id_(next_id_.fetch_add(1)),
           data_(LocalDiskReplicaData{client_id, object_size,
-                                     std::move(transport_endpoint)}),
+                                     std::move(transport_endpoint),
+                                     record_offset, std::move(file_path)}),
           status_(status),
           refcnt_(0) {
         MasterMetricManager::instance().inc_allocated_file_size(object_size);
@@ -748,6 +760,8 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         local_disk_desc.client_id = disk_data.client_id;
         local_disk_desc.object_size = disk_data.object_size;
         local_disk_desc.transport_endpoint = disk_data.transport_endpoint;
+        local_disk_desc.record_offset = disk_data.record_offset;
+        local_disk_desc.file_path = disk_data.file_path;
         desc.descriptor_variant = std::move(local_disk_desc);
     } else if (is_dfs_replica()) {
         desc.descriptor_variant = std::get<DfsReplicaData>(data_).descriptor;

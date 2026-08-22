@@ -94,6 +94,15 @@
 #include "glog/logging.h"
 #include "storage_backend.h"
 
+#if defined(USE_PHOENIX) && defined(USE_CUDA)
+#include <cuda_runtime.h>
+
+#include <phoenix.h>
+
+#include "device/accelerator_registry.h"
+#include "phoenix_gds.h"
+#endif
+
 namespace fs = std::filesystem;
 
 // ============================================================================
@@ -123,6 +132,16 @@ DEFINE_string(test, "all",
               "mixed_rw, churn, restart, all");
 
 // === PR1: Verification & Correctness ===
+DEFINE_bool(phoenix, false,
+            "load test reads via Phoenix GDS (BatchReadPlan + "
+            "PhxReadBatch) straight into a GPU buffer; requires "
+            "STORE_USE_PHOENIX build, the phxfs module, and a GPU");
+DEFINE_int32(gpu_device_id, 0,
+             "GPU device id for --phoenix direct read");
+DEFINE_bool(h2d, false,
+            "after legacy BatchLoad (SSD→CPU), also H2D copy to GPU; "
+            "measures the full SSD→CPU→GPU path for fair comparison with "
+            "--phoenix");
 DEFINE_bool(verify, true, "Enable data integrity verification (default: true)");
 DEFINE_uint64(verify_rate, 1,
               "Verify 1 in N operations (default: 1 = verify all)");
@@ -307,6 +326,27 @@ static bool DropLinuxPageCacheGlobal() {
     return false;
 #endif
 }
+
+#if defined(USE_PHOENIX)
+// Evict page cache so O_DIRECT reads measure disk, not RAM.
+static bool FlushAndEvictFileCache(const std::string& path) {
+    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        LOG(ERROR) << "open " << path << ": " << std::strerror(errno);
+        return false;
+    }
+    bool ok = true;
+    if (fdatasync(fd) != 0) {
+        LOG(ERROR) << "fdatasync " << path << ": " << std::strerror(errno);
+        ok = false;
+    } else if (int rc = posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)) {
+        LOG(ERROR) << "FADV_DONTNEED " << path << ": " << std::strerror(rc);
+        ok = false;
+    }
+    close(fd);
+    return ok;
+}
+#endif
 
 // ============================================================================
 // Thread-Local Statistics (NO MUTEX in hot path)
@@ -1304,6 +1344,60 @@ void BenchBatchLoad(BackendType type, const std::string& storage_path,
         }
     }
 
+#if defined(USE_PHOENIX) && defined(USE_CUDA)
+    // --phoenix: timed read goes SSD → GPU via BatchReadPlan + PhxReadBatch.
+    // --h2d: after legacy BatchLoad (SSD→CPU), also H2D copy to GPU.
+    void* gpu_buf = nullptr;
+    size_t gpu_buf_size = 0;
+    std::unordered_map<std::string, std::vector<mooncake::Slice>> direct_batch;
+    std::vector<char> direct_done;
+    if (FLAGS_phoenix || FLAGS_h2d) {
+        if (FLAGS_phoenix) {
+            const std::string data_path = storage_path + "/kv_cache.data";
+            if (!FlushAndEvictFileCache(data_path)) {
+                LOG(ERROR) << "Cannot establish a page-cache-free direct read "
+                              "test; aborting";
+                return;
+            }
+        }
+        gpu_buf_size = aligned_size * batch_size;
+        if (cudaSetDevice(FLAGS_gpu_device_id) != cudaSuccess ||
+            cudaMalloc(&gpu_buf, gpu_buf_size) != cudaSuccess) {
+            LOG(ERROR) << "cuda setup failed";
+            return;
+        }
+        // Touch pages: cudaMalloc is lazily backed.
+        cudaMemset(gpu_buf, 0, gpu_buf_size);
+        cudaStreamSynchronize(0);
+        if (FLAGS_phoenix) {
+            if (mooncake::PhoenixCtx::Instance().Register(
+                    reinterpret_cast<uintptr_t>(gpu_buf),
+                    gpu_buf_size) != 0) {
+                LOG(ERROR) << "PhoenixCtx::Register failed";
+                cudaFree(gpu_buf);
+                return;
+            }
+            std::cout << "  Phoenix mode: GPU buffer " << (gpu_buf_size / MB)
+                      << " MB on device " << FLAGS_gpu_device_id << ", engine "
+                      << phxfs_io_engine_name() << "\n";
+        } else {
+            std::cout << "  H2D mode: GPU buffer " << (gpu_buf_size / MB)
+                      << " MB on device " << FLAGS_gpu_device_id
+                      << " (SSD→CPU + H2D→GPU)\n";
+        }
+    }
+#else
+    if (FLAGS_phoenix) {
+        LOG(ERROR) << "--phoenix requires a build with STORE_USE_PHOENIX=ON "
+                      "and a CUDA toolkit";
+        return;
+    }
+    if (FLAGS_h2d) {
+        LOG(ERROR) << "--h2d requires a CUDA toolkit";
+        return;
+    }
+#endif
+
     std::cout << "  Aligned buffer size: " << (aligned_size / KB) << " KB\n";
     std::cout << "  Warmup: " << warmup_operations << " operations\n";
     std::cout << "  Benchmark: " << num_operations << " operations\n";
@@ -1347,11 +1441,64 @@ void BenchBatchLoad(BackendType type, const std::string& storage_path,
 
         // === TIMED REGION - ONLY THE ACTUAL OPERATION ===
         auto start = std::chrono::steady_clock::now();
-        auto result = backend->BatchLoad(batch.load_batch);
+        bool read_ok;
+#if defined(USE_PHOENIX) && defined(USE_CUDA)
+        if (FLAGS_phoenix) {
+            direct_batch.clear();
+            for (size_t i = 0; i < batch_size; ++i) {
+                direct_batch.emplace(
+                    keys.Get(batch.key_indices[i]),
+                    std::vector<mooncake::Slice>{
+                        {static_cast<char*>(gpu_buf) + i * aligned_size,
+                         value_size}});
+            }
+            auto plan = backend->BatchReadPlan(direct_batch);
+            int rc = (plan && !plan.value().empty())
+                         ? mooncake::PhxReadBatch(plan.value(), direct_done)
+                         : -1;
+            // Success: every slice was planned and landed.
+            size_t served = 0;
+            if (rc == 0) {
+                for (char d : direct_done) served += d ? 1 : 0;
+            }
+            read_ok = plan && served == plan.value().size() &&
+                      plan.value().size() == batch_size;
+        } else
+#endif
+        {
+            read_ok = backend->BatchLoad(batch.load_batch).has_value();
+#if defined(USE_PHOENIX) && defined(USE_CUDA)
+            if (read_ok && FLAGS_h2d) {
+                // H2D: copy each slice CPU→GPU to simulate full path.
+                for (size_t i = 0; i < batch_size; ++i) {
+                    cudaMemcpyAsync(
+                        static_cast<char*>(gpu_buf) + i * aligned_size,
+                        read_buffers.Get(i), value_size,
+                        cudaMemcpyHostToDevice, 0);
+                }
+                cudaStreamSynchronize(0);
+            }
+#endif
+        }
         auto end = std::chrono::steady_clock::now();
         // === END TIMED REGION ===
 
         key_index += batch_size;
+
+#if defined(USE_PHOENIX) && defined(USE_CUDA)
+        // D2H copy so VerifyBuffer can check data on CPU.
+        auto d2h = [&]() {
+            if (!FLAGS_phoenix || !read_ok) return;
+            auto acc = mooncake::device::GetAcceleratorRegistry()
+                           .RuntimeAccelerators();
+            for (size_t i = 0; i < batch_size; ++i) {
+                acc.CopyToHost(read_buffers.Get(i),
+                               static_cast<char*>(gpu_buf) +
+                                   i * aligned_size,
+                               value_size);
+            }
+        };
+#endif
 
         // === VERIFICATION OUTSIDE TIMED REGION ===
         if (!is_warmup) {
@@ -1360,9 +1507,12 @@ void BenchBatchLoad(BackendType type, const std::string& storage_path,
             thread_stats.RecordLatency(latency_ms);
             thread_stats.RecordOperation();
 
-            if (result) {
+            if (read_ok) {
                 thread_stats.RecordBytes(batch_size * value_size);
 
+#if defined(USE_PHOENIX) && defined(USE_CUDA)
+                d2h();
+#endif
                 // Verify based on rate (use measured op index, not total op
                 // index)
                 size_t measured_op = op - warmup_operations;
@@ -1384,7 +1534,10 @@ void BenchBatchLoad(BackendType type, const std::string& storage_path,
             }
         } else if (FLAGS_verify_warmup_all && FLAGS_verify) {
             // Verify all warmup ops
-            if (result) {
+            if (read_ok) {
+#if defined(USE_PHOENIX) && defined(USE_CUDA)
+                d2h();
+#endif
                 for (size_t i = 0; i < batch_size; ++i) {
                     if (!gen.VerifyBuffer(read_buffers.Get(i), value_size,
                                           batch.key_indices[i])) {
@@ -1406,6 +1559,16 @@ void BenchBatchLoad(BackendType type, const std::string& storage_path,
     CheckVerification(thread_stats.checksum_failures, "BatchLoad");
 
     stats.PrintStatistics("BATCH_LOAD");
+
+#if defined(USE_PHOENIX) && defined(USE_CUDA)
+    if ((FLAGS_phoenix || FLAGS_h2d) && gpu_buf != nullptr) {
+        if (FLAGS_phoenix) {
+            mooncake::PhoenixCtx::Instance().Unregister(
+                reinterpret_cast<uintptr_t>(gpu_buf), gpu_buf_size);
+        }
+        cudaFree(gpu_buf);
+    }
+#endif
 }
 
 // ============================================================================

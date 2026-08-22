@@ -11,9 +11,11 @@
 #include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
 #include <algorithm>
+#include <filesystem>
 #include <functional>
 #include <limits>
 #include <optional>
+#include <unordered_set>
 #include <vector>
 
 #include "real_client.h"
@@ -39,6 +41,10 @@
 #include "memory_location.h"
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
+#endif
+#ifdef USE_PHOENIX
+#include "phoenix_gds.h"
+#include "phoenix_offload_read.h"
 #endif
 #ifdef USE_ASCEND_DIRECT
 #include "acl/acl_rt.h"
@@ -783,6 +789,21 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
 #endif
 
+#ifdef USE_PHOENIX
+    // Phoenix GDS is opt-in at compile time (STORE_USE_PHOENIX=ON), but at
+    // runtime the phxfs kernel module may be intentionally absent — e.g. the
+    // "ssd" baseline leg of a benchmark comparison, or a deployment that only
+    // wants the Mooncake legacy path. Degrade gracefully: log a warning and
+    // skip Phoenix initialization; the legacy RPC + pread path handles all
+    // reads. GPU buffer registration is automatic when the module is present;
+    // when absent, register_buffer_internal() simply skips PhoenixCtx.
+    if (!PhoenixCtx::Instance().module_present()) {
+        LOG(WARNING) << "Phoenix: phxfs module not present "
+                        "(/dev/phxfs_dev0 missing); built with "
+                        "STORE_USE_PHOENIX=ON but degrading to legacy path";
+    }
+#endif
+
     std::optional<std::string> device_name =
         ((rdma_devices.empty() || rdma_devices == "auto-discovery")
              ? std::nullopt
@@ -1132,6 +1153,38 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         if (!ssd_offload_path.empty()) {
             file_storage_config.storage_filepath = ssd_offload_path;
         }
+#ifdef USE_PHOENIX
+        if (file_storage_config.storage_backend_type !=
+            StorageBackendType::kOffsetAllocator) {
+            LOG(ERROR) << "Phoenix: STORE_USE_PHOENIX=ON requires "
+                          "offset_allocator_storage_backend; current type is "
+                       << static_cast<int>(
+                              file_storage_config.storage_backend_type);
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        // Embedded mode runs one RealClient per worker process while all
+        // workers share the same storage path. The offset-allocator backend
+        // keeps its allocator state in-process, so sharing one kv_cache.data
+        // makes workers hand out overlapping offsets and overwrite each
+        // other's records (reads then fail key validation, FILE_READ_FAIL).
+        // Give each process a private subdirectory. The check above
+        // guarantees the backend is kOffsetAllocator here.
+        {
+            namespace fs = std::filesystem;
+            fs::path per_client_dir =
+                fs::path(file_storage_config.storage_filepath) /
+                ("client_" + std::to_string(::getpid()));
+            std::error_code ec;
+            fs::create_directories(per_client_dir, ec);
+            if (ec) {
+                LOG(ERROR) << "Failed to create per-client storage dir "
+                           << per_client_dir << ": " << ec.message();
+                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            LOG(INFO) << "SSD offload using per-client dir: " << per_client_dir;
+            file_storage_config.storage_filepath = per_client_dir.string();
+        }
+#endif
         file_storage_ = std::make_shared<FileStorage>(
             file_storage_config, client_, this->local_rpc_addr,
             client_->GetSsdMetricPtr());
@@ -3384,6 +3437,10 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
     if (!result) {
         return result;
     }
+#ifdef USE_PHOENIX
+    PhoenixCtx::Instance().Register(reinterpret_cast<uintptr_t>(buffer),
+                                     size);
+#endif
     {
         std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
         registered_buffer_sizes_[buffer] = size;
@@ -3407,6 +3464,16 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
                    << toString(unregister_result.error());
         return tl::unexpected(unregister_result.error());
     }
+#ifdef USE_PHOENIX
+    {
+        std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        auto it = registered_buffer_sizes_.find(buffer);
+        if (it != registered_buffer_sizes_.end()) {
+            PhoenixCtx::Instance().Unregister(
+                reinterpret_cast<uintptr_t>(buffer), it->second);
+        }
+    }
+#endif
     {
         std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
         registered_buffer_sizes_.erase(buffer);
@@ -6298,8 +6365,91 @@ RealClient::batch_get_into_multi_buffers_internal(
                 std::unordered_map<std::string, std::vector<Slice>>>
                 offload_objects;
 
+#ifdef USE_PHOENIX
+            // Phoenix same-host direct read: LOCAL_DISK replicas whose
+            // descriptor carries the record's file location (record_offset +
+            // file_path) are DMA-read straight from the local NVMe into the
+            // user buffers, bypassing the owner-RPC staging path — including
+            // replicas owned by other co-located worker processes. Unserved
+            // keys fall through to the endpoint grouping below unchanged.
+            std::unordered_set<std::string> phx_direct_served;
+            {
+                std::vector<phoenix_offload::DirectReadCandidate> phx_cands;
+                std::vector<std::string> phx_keys;
+                std::vector<std::string> phx_scoped;
+                std::vector<std::vector<Slice>> phx_slices;
+                phx_cands.reserve(valid_local_disk_ops.size());
+                phx_keys.reserve(valid_local_disk_ops.size());
+                phx_scoped.reserve(valid_local_disk_ops.size());
+                phx_slices.reserve(valid_local_disk_ops.size());
+                TenantId phx_tenant(client_->tenant_id());
+                // Extract local host (strip port) for same-host validation.
+                std::string phx_local_host;
+                {
+                    auto colon = local_rpc_addr.rfind(':');
+                    phx_local_host = (colon != std::string::npos)
+                                         ? local_rpc_addr.substr(0, colon)
+                                         : local_rpc_addr;
+                }
+                for (auto &[key, op] : valid_local_disk_ops) {
+                    if (!op.is_local_disk) continue;
+                    const Replica::Descriptor *replica = nullptr;
+                    for (const auto &r : op.query_result.replicas) {
+                        if (r.is_local_disk_replica()) {
+                            replica = &r;
+                            break;
+                        }
+                    }
+                    if (replica == nullptr) continue;
+                    const auto &desc = replica->get_local_disk_descriptor();
+                    if (desc.record_offset < 0 || desc.file_path.empty()) {
+                        continue;
+                    }
+                    size_t slice_total = 0;
+                    for (size_t j = 0; j < op.buffers.size(); ++j) {
+                        slice_total += op.sizes[j];
+                    }
+                    if (slice_total != op.total_size) continue;
+
+                    phx_scoped.push_back(phx_tenant.MakeScopedKey(key));
+                    phx_slices.emplace_back();
+                    phx_slices.back().reserve(op.buffers.size());
+                    for (size_t j = 0; j < op.buffers.size(); ++j) {
+                        phx_slices.back().push_back(
+                            Slice{op.buffers[j], op.sizes[j]});
+                    }
+                    phx_keys.push_back(key);
+                    phx_cands.push_back(phoenix_offload::DirectReadCandidate{
+                        replica, phx_scoped.back().size(), &phx_slices.back(),
+                        op.total_size, phx_local_host});
+                }
+                if (!phx_cands.empty()) {
+                    std::vector<bool> served;
+                    phoenix_offload::ServeDirectReads(phx_cands, served);
+                    for (size_t i = 0; i < phx_cands.size(); ++i) {
+                        if (!served[i]) continue;
+                        const auto &key = phx_keys[i];
+                        const auto &op = valid_local_disk_ops.at(key);
+                        if (client_->VerifyObjectChecksum(
+                                key, phx_slices[i], op.total_size,
+                                op.query_result.object_checksum)) {
+                            phx_direct_served.insert(key);
+                        } else {
+                            LOG(ERROR)
+                                << "Phoenix offload: checksum mismatch after "
+                                   "direct read for key: "
+                                << key << ", falling back to RPC";
+                        }
+                    }
+                }
+            }
+#endif
+
             for (auto &[key, op] : valid_local_disk_ops) {
                 if (!op.is_local_disk) continue;
+#ifdef USE_PHOENIX
+                if (phx_direct_served.count(key) != 0) continue;
+#endif
                 const auto &replica = op.replica;
                 if (!replica.is_local_disk_replica()) {
                     LOG(ERROR)
@@ -6819,6 +6969,67 @@ RealClient::batch_get_into_offload_object_internal(
     const OffloadReadRange *read_range) {
     offload_rpc_read_count_.fetch_add(1, std::memory_order_relaxed);
     auto start_time = std::chrono::steady_clock::now();
+#ifdef USE_PHOENIX
+    // Keys served by the direct read path (below). They are restored into
+    // `objects` only on success, so the caller's contract ("on success
+    // `objects` holds every input key") is preserved.
+    std::vector<std::pair<std::string, std::vector<Slice>>> direct_served;
+    // Direct read fast path: when the disk replica is owned by THIS process
+    // (embedded real client), the destination slices are registered
+    // and DMA-aligned, read them straight from local SSD into GPU memory,
+    // skipping the RPC + CPU staging + transfer-engine hops. Keys that do
+    // not qualify (or fail) fall through to the legacy path below.
+    if (file_storage_ && target_rpc_service_addr == local_rpc_addr) {
+        const TenantId direct_tenant(client_->tenant_id());
+        // The backend indexes objects by tenant-scoped key; the direct path
+        // must plan with scoped keys, while `objects` keeps user keys.
+        std::unordered_map<std::string, std::vector<Slice>> direct_read_map;
+        std::unordered_map<std::string, std::vector<Slice>> candidate_slices;
+        for (auto it = objects.begin(); it != objects.end();) {
+            if (PhoenixCtx::Instance().has_registrations(it->second)) {
+                direct_read_map.emplace(direct_tenant.MakeScopedKey(it->first),
+                                        it->second);
+                candidate_slices.emplace(it->first, std::move(it->second));
+                it = objects.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (!direct_read_map.empty()) {
+            const size_t attempted = direct_read_map.size();
+            // BatchLoadDirect erases served (scoped) keys from direct_read_map.
+            file_storage_->BatchLoadDirect(direct_read_map);
+            const size_t served = attempted - direct_read_map.size();
+            // Unserved leftovers: straight back to `objects` for the legacy
+            // path (TE reads into the same slices).
+            for (auto &[scoped_key, slices] : direct_read_map) {
+                auto [_, user_key] = TenantId::ParseScopedKey(scoped_key);
+                auto cs = candidate_slices.find(user_key);
+                if (cs != candidate_slices.end()) {
+                    objects.emplace(user_key, std::move(cs->second));
+                    candidate_slices.erase(cs);
+                }
+            }
+            // Served keys: defer restoration until this function succeeds.
+            for (auto &[user_key, slices] : candidate_slices) {
+                direct_served.emplace_back(user_key, std::move(slices));
+            }
+            if (served > 0) {
+                VLOG(1) << "Direct read served " << served << "/"
+                        << attempted << " keys locally";
+            } else {
+                VLOG(1) << "Direct read unavailable, using legacy path";
+            }
+            if (objects.empty()) {
+                // Everything was served directly: restore and finish.
+                for (auto &[k, v] : direct_served) {
+                    objects.emplace(std::move(k), std::move(v));
+                }
+                return {};
+            }
+        }
+    }
+#endif
     std::vector<std::string> keys;
     std::vector<std::string> storage_keys;
     std::vector<int64_t> sizes;
@@ -6919,6 +7130,13 @@ RealClient::batch_get_into_offload_object_internal(
     if (!local_batch && elapsed_time >= response->gc_ttl_ms) {
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
+    // Success: restore directly-served keys so the caller sees every input
+    // key present in `objects`.
+#ifdef USE_PHOENIX
+    for (auto &[k, v] : direct_served) {
+        objects.emplace(std::move(k), std::move(v));
+    }
+#endif
     return {};
 }
 

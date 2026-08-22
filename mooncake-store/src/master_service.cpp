@@ -2770,6 +2770,22 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
 #endif
 }
 
+namespace {
+
+// Whether existence checks (ExistKey/BatchExistKey) grant leases.
+// Default: enabled (upstream behavior). Set MOONCAKE_MASTER_EXIST_GRANT_LEASE=0
+// for read-heavy workloads where speculative probes would otherwise pin almost
+// the entire working set and starve eviction.
+bool ExistGrantLeaseEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("MOONCAKE_MASTER_EXIST_GRANT_LEASE");
+        return v == nullptr || std::string(v) != "0";
+    }();
+    return enabled;
+}
+
+}  // namespace
+
 auto MasterService::ExistKey(const std::string& key, const TenantId& tenant_id)
     -> tl::expected<bool, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -2786,11 +2802,20 @@ auto MasterService::ExistKey(const std::string& key, const TenantId& tenant_id)
     }
 
     // Grant a lease to the object as it may be further used by the client.
-    auto* ts = accessor.GetTenantState();
-    if (ts) {
-        GrantLeaseForGroup(*ts, key, metadata);
-    } else {
-        metadata.GrantReadLease(default_kv_lease_ttl_);
+    // MOONCAKE_MASTER_EXIST_GRANT_LEASE=0 disables this for read-heavy
+    // workloads: existence probes arrive at a far higher rate than actual
+    // reads (vLLM probes every block hash of every request), so leasing here
+    // keeps nearly the entire working set permanently leased and starves
+    // eviction (observed Eviction Success/Attempts = 39/1123, puts rejected
+    // with NO_AVAILABLE_HANDLE). Actual reads stay protected either way —
+    // GetReplicaList grants its own lease.
+    if (ExistGrantLeaseEnabled()) {
+        auto* ts = accessor.GetTenantState();
+        if (ts) {
+            GrantLeaseForGroup(*ts, key, metadata);
+        } else {
+            metadata.GrantReadLease(default_kv_lease_ttl_);
+        }
     }
     return true;
 }
@@ -2856,7 +2881,9 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
                 results[i] = false;
                 continue;
             }
-            GrantLeaseForGroup(tenant_state, key, metadata);
+            if (ExistGrantLeaseEnabled()) {
+                GrantLeaseForGroup(tenant_state, key, metadata);
+            }
             results[i] = true;
         }
     }
@@ -7406,7 +7433,8 @@ auto MasterService::NotifyOffloadSuccess(
         }
 
         Replica replica(client_id, metadata.data_size,
-                        metadata.transport_endpoint, ReplicaStatus::COMPLETE);
+                        metadata.transport_endpoint, ReplicaStatus::COMPLETE,
+                        metadata.offset, metadata.file_path);
         bool handled_existing_object = false;
         bool added_new_local_disk_replica = false;
         {

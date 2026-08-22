@@ -61,3 +61,21 @@ endif()
 
 add_executable(uring_batch_read_bench uring_batch_read_bench.cpp)
 target_link_libraries(uring_batch_read_bench PRIVATE mooncake_store)
+
+# --phoenix mode of storage_backend_bench: a vendor runtime is needed only
+# to allocate the GPU destination buffer. Detect the toolkit locally
+# (find_package results do not cross sibling directory scopes), same QUIET
+# pattern as mooncake_store's D2H staging; without it the mode stays
+# unavailable.
+if(STORE_USE_PHOENIX)
+  find_package(CUDAToolkit QUIET)
+  if(CUDAToolkit_FOUND)
+    target_link_libraries(storage_backend_bench PRIVATE CUDA::cudart)
+    target_include_directories(storage_backend_bench
+                               PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    target_compile_definitions(storage_backend_bench PRIVATE USE_CUDA)
+  else()
+    message(STATUS "storage_backend_bench: CUDAToolkit not found, "
+                   "--phoenix mode unavailable")
+  endif()
+endif()

@@ -23,6 +23,9 @@
 
 #include "integration_utils.h"
 #include "buffer_pool.h"
+#ifdef USE_PHOENIX
+#include "phoenix_gds.h"
+#endif
 
 // Forward declaration for EngramStore bindings
 namespace mooncake {

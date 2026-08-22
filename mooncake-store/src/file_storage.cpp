@@ -15,6 +15,9 @@
 #ifdef USE_URING
 #include "file_interface.h"
 #endif
+#ifdef USE_PHOENIX
+#include "phoenix_gds.h"
+#endif
 
 namespace mooncake {
 
@@ -1001,6 +1004,67 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
 
     return {};
 }
+
+#ifdef USE_PHOENIX
+tl::expected<void, ErrorCode> FileStorage::BatchLoadDirect(
+    std::unordered_map<std::string, std::vector<Slice>>& batched_objects) {
+    auto start_time = std::chrono::steady_clock::now();
+    auto plan_result = storage_backend_->BatchReadPlan(batched_objects);
+    if (!plan_result) {
+        return tl::make_unexpected(plan_result.error());
+    }
+    auto items = std::move(plan_result.value());
+    if (items.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::vector<char> done;
+    auto read_result = PhxReadBatch(items, done);
+    if (read_result != 0) {
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    // A key is served only when ALL its slices completed; per-key aggregate
+    // (items of one key are contiguous from BatchReadPlan's per-key loop).
+    size_t served = 0;
+    int64_t total_bytes = 0;
+    size_t i = 0;
+    while (i < items.size()) {
+        size_t j = i;
+        bool all_done = true;
+        int64_t key_bytes = 0;
+        while (j < items.size() && items[j].key == items[i].key) {
+            all_done = all_done && done[j];
+            key_bytes += static_cast<int64_t>(items[j].nbytes);
+            ++j;
+        }
+        if (all_done) {
+            batched_objects.erase(items[i].key);
+            ++served;
+            total_bytes += key_bytes;
+        }
+        i = j;
+    }
+    if (served == 0) {
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() - start_time)
+                          .count();
+    VLOG(1) << "FileStorage::BatchLoadDirect: " << elapsed_us << "us, "
+            << served << " keys, " << total_bytes << " bytes";
+    if (ssd_metric_) {
+        ssd_metric_->ssd_read_ops.inc(served);
+        ssd_metric_->ssd_read_bytes.inc(total_bytes);
+        ssd_metric_->ssd_read_latency_us.observe(elapsed_us);
+        ssd_metric_->ssd_total_ops.inc(served);
+        ssd_metric_->ssd_total_bytes.inc(total_bytes);
+        ssd_metric_->ssd_total_latency_us.observe(elapsed_us);
+    }
+    return {};
+}
+#endif
 
 tl::expected<void, ErrorCode> FileStorage::BatchLoad(
     std::unordered_map<std::string, Slice>& batch_object) {

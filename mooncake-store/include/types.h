@@ -517,8 +517,11 @@ struct StorageObjectMetadata {
     int64_t key_size;
     int64_t data_size;
     std::string transport_endpoint;
+    // Phoenix direct-read passthrough: absolute path of the data file holding
+    // this record (empty = unknown; readers then fall back to the RPC path).
+    std::string file_path;
     YLT_REFL(StorageObjectMetadata, bucket_id, offset, key_size, data_size,
-             transport_endpoint);
+             transport_endpoint, file_path);
 };
 
 }  // namespace mooncake

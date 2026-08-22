@@ -531,10 +531,31 @@ Client::~Client() {
     hot_cache_.reset();
 }
 
+// Opt-in via MOONCAKE_PREFER_LOCAL_SEGMENT=1. Read once; the environment does
+// not change while a client is alive.
+static bool PreferLocalSegmentEnabled() {
+    static const bool enabled =
+        Environ::GetBool("MOONCAKE_PREFER_LOCAL_SEGMENT", false);
+    return enabled;
+}
+
 ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
     ReplicateConfig client_cfg = config;
     if (!host_id_.empty()) {
         client_cfg.host_id = host_id_;
+    }
+    // Prefer this client's own segment for allocation. The host-granular
+    // policies (allocation_strategy=local_first, prefer_alloc_in_same_node)
+    // cannot separate clients that share one host_id, so co-located workers
+    // otherwise scatter their objects over each other's segments — every later
+    // read of such an object becomes a cross-process RPC plus transfer-engine
+    // hop. Segment names are per-client (see MountSegment), which makes this
+    // preference exact. An explicit caller preference wins, and allocation
+    // still falls back to other segments when the local one cannot serve the
+    // request.
+    if (PreferLocalSegmentEnabled() && client_cfg.preferred_segment.empty() &&
+        client_cfg.preferred_segments.empty() && !local_hostname_.empty()) {
+        client_cfg.preferred_segment = local_hostname_;
     }
     return client_cfg;
 }
@@ -571,7 +592,8 @@ static std::vector<std::string> get_auto_discover_filters() {
 
     LOG(INFO) << "whitelist filters: " << raw_filters;
     std::vector<std::string> filters;
-    boost::split(filters, std::string(raw_filters), boost::is_any_of(","),
+    std::string raw(raw_filters);
+    boost::split(filters, raw, boost::is_any_of(","),
                  boost::token_compress_off);
     for (auto& filter : filters) {
         filter = std::string(TrimAsciiWhitespace(filter));
@@ -581,7 +603,8 @@ static std::vector<std::string> get_auto_discover_filters() {
 
 static std::vector<std::string> ParseDeviceNames(std::string_view value) {
     std::vector<std::string> devices;
-    boost::split(devices, std::string(value), boost::is_any_of(","),
+    std::string val(value);
+    boost::split(devices, val, boost::is_any_of(","),
                  boost::token_compress_on);
     for (auto& device : devices) {
         device = std::string(TrimAsciiWhitespace(device));

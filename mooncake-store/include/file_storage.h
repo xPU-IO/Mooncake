@@ -81,6 +81,25 @@ class FileStorage {
         return pinned_restore_arena_allocator_ != nullptr;
     }
 
+    /**
+     * @brief Direct-read keys from local SSD into their destination slices
+     * via Phoenix DMA (STORE_USE_PHOENIX builds only), bypassing the CPU
+     * staging buffer.
+     *
+     * @param batched_objects In/out map of key -> destination Slices (each
+     * must lie inside a Phoenix-registered GPU range and satisfy DMA
+     * alignment). Keys whose slices are ALL successfully read are ERASED
+     * from the map; keys left in the map must be served through the legacy
+     * path (BatchGet/BatchLoad).
+     * @return tl::expected<void, ErrorCode>; an error means nothing was read
+     * (map left untouched).
+     */
+#ifdef USE_PHOENIX
+    tl::expected<void, ErrorCode> BatchLoadDirect(
+        std::unordered_map<std::string, std::vector<Slice>>&
+            batched_objects);
+#endif
+
     FileStorageConfig config_;
 
     /**

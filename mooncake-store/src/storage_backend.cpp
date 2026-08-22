@@ -3705,6 +3705,25 @@ OffsetAllocatorStorageBackend::OffsetAllocatorStorageBackend(
     capacity_ = file_storage_config_.total_size_limit;
 }
 
+#ifdef USE_PHOENIX
+void OffsetAllocatorStorageBackend::OpenDirectFd() {
+    if (direct_fd_.fd >= 0 || data_file_path_.empty()) return;
+    // Dedicated O_DIRECT fd for direct reads. Kept separate from
+    // data_file_ so the legacy path is untouched; failure only disables
+    // the direct path (every read then falls back to BatchLoad).
+    direct_fd_.fd =
+        open(data_file_path_.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+    if (direct_fd_.fd < 0) {
+        LOG(WARNING) << "Phoenix: cannot open O_DIRECT fd for "
+                     << data_file_path_ << ": " << strerror(errno)
+                     << " (direct read disabled)";
+    } else {
+        LOG(INFO) << "Phoenix: O_DIRECT fd opened for direct read on "
+                  << data_file_path_;
+    }
+}
+#endif
+
 OffsetAllocatorStorageBackend::~OffsetAllocatorStorageBackend() {
     try {
         if (cfg_.persist_mode == OffsetPersistMode::kDisabled) return;
@@ -3872,6 +3891,11 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
                         std::chrono::steady_clock::now().time_since_epoch())
                         .count(),
                     std::memory_order_relaxed);
+                // The recovery path skips the fresh-start section below, so
+                // the Phoenix direct-read fd must be (re)opened here too.
+#ifdef USE_PHOENIX
+                OpenDirectFd();
+#endif
                 initialized_.store(true, std::memory_order_release);
                 LOG(INFO) << "OffsetAllocatorStorageBackend recovered: "
                           << total_keys_.load() << " keys, "
@@ -3942,6 +3966,10 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
         if (cfg_.persist_mode != OffsetPersistMode::kDisabled) {
             data_file_->SetDeleteOnWriteFail(false);
         }
+
+#ifdef USE_PHOENIX
+        OpenDirectFd();
+#endif
 
         // Create allocator with tuned node capacity
         constexpr int64_t kMinObjectSize = 256;
@@ -5228,7 +5256,8 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         metadatas.push_back(
             StorageObjectMetadata{0, static_cast<int64_t>(offset),
                                   static_cast<int64_t>(header.key_len),
-                                  static_cast<int64_t>(value_size), ""});
+                                  static_cast<int64_t>(value_size), "",
+                                  data_file_path_});
     }
 
     // ---- Post-loop flush: notify master of any evicted keys that
@@ -5482,6 +5511,71 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
 
     return {};
 }
+
+//-----------------------------------------------------------------------------
+
+#ifdef USE_PHOENIX
+tl::expected<std::vector<DirectIoItem>, ErrorCode>
+OffsetAllocatorStorageBackend::BatchReadPlan(
+    const std::unordered_map<std::string, std::vector<Slice>>&
+        batched_objects) {
+    std::vector<DirectIoItem> items;
+    if (direct_fd_.fd < 0 ||
+        !initialized_.load(std::memory_order_acquire)) {
+        return items;
+    }
+    items.reserve(batched_objects.size());
+    for (const auto& [key, slices] : batched_objects) {
+        const size_t shard_idx = ShardForKey(key);
+        auto& shard = shards_[shard_idx];
+
+        AllocationPtr allocation;
+        uint64_t value_offset = 0;
+        uint32_t value_size = 0;
+        {
+            SharedMutexLocker lock(&shard.mutex, /*shared_mode=*/shared_lock);
+            auto it = shard.map.find(key);
+            if (it == shard.map.end()) continue;
+            const auto& entry = it->second;
+            uint64_t total = 0;
+            for (const auto& s : slices) total += s.size;
+            if (total != entry.value_size) continue;
+            value_offset =
+                entry.offset +
+                RecordHeader::ValueOffsetInRecord(
+                    static_cast<uint32_t>(key.size()));
+            value_size = entry.value_size;
+            allocation = entry.allocation;  // keeps the extent alive
+        }
+
+        // Flatten slices into per-slice items with cumulative offsets.
+        // DMA alignment: every slice's file offset must be 4 KiB aligned
+        // (v3 aligns the value region within the record; the record start
+        // must also be aligned) and every slice length a 512 B multiple.
+        // A key failing any check is skipped entirely (served by BatchLoad).
+        bool aligned = (value_offset % 4096 == 0);
+        uint64_t cumulative = 0;
+        for (const auto& s : slices) {
+            if ((value_offset + cumulative) % 4096 != 0 || s.size % 512 != 0) {
+                aligned = false;
+                break;
+            }
+            cumulative += s.size;
+        }
+        if (!aligned || cumulative != value_size) continue;
+
+        cumulative = 0;
+        for (const auto& s : slices) {
+            items.push_back(DirectIoItem{
+                key, direct_fd_.fd,
+                static_cast<off_t>(value_offset + cumulative), s.size, s,
+                allocation});
+            cumulative += s.size;
+        }
+    }
+    return items;
+}
+#endif
 
 //-----------------------------------------------------------------------------
 
