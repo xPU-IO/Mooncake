@@ -3208,8 +3208,14 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                     return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                 }
                 replicas.emplace_back(
-                    local_disk_desc.client_id, local_disk_desc.object_size,
-                    local_disk_desc.transport_endpoint, desc.status);
+                    local_disk_desc.client_id,
+                    local_disk_desc.object_size,
+                    local_disk_desc.transport_endpoint, desc.status,
+                    // Phoenix direct-read passthrough: preserve the
+                    // record location so restored replicas keep serving
+                    // same-host direct reads after standby promotion.
+                    local_disk_desc.record_offset,
+                    local_disk_desc.file_path);
             }
         }
         objects_by_shard[shard_idx].push_back({&entry, std::move(tenant_id),

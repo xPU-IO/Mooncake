@@ -5681,7 +5681,12 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ScanMeta(
                     // contains header and alignment padding, so it cannot
                     // be derived arithmetically.
                     static_cast<int64_t>(key.size()),
-                    static_cast<int64_t>(entry.value_size), ""});
+                    static_cast<int64_t>(entry.value_size), "",
+                    // Phoenix direct-read passthrough: after a worker
+                    // restart the data file path is stable (storage_path_
+                    // / kv_cache.data), so re-registered records remain
+                    // eligible for same-host direct reads.
+                    data_file_path_});
 
                 // Call handler when batch limit is reached
                 if (static_cast<int64_t>(keys.size()) >=

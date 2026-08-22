@@ -705,11 +705,18 @@ tl::expected<void, SerializationError> Serializer<Replica>::serialize(
                     ErrorCode::DESERIALIZE_FAIL,
                     "serialize_msgpack Replica missing LocalDiskReplicaData"));
             }
-            // Format: [client_id_str, object_size, transport_endpoint]
-            packer.pack_array(3);
+            // Format: [client_id_str, object_size, transport_endpoint,
+            //          record_offset, file_path]
+            // The last two fields carry the Phoenix direct-read passthrough
+            // location. Deserialization also accepts the legacy 3-element
+            // layout (fields default to "unknown" → readers fall back to
+            // the owner RPC path).
+            packer.pack_array(5);
             packer.pack(UuidToString(local_data->client_id));
             packer.pack(static_cast<uint64_t>(local_data->object_size));
             packer.pack(local_data->transport_endpoint);
+            packer.pack(local_data->record_offset);
+            packer.pack(local_data->file_path);
             break;
         }
         case ReplicaType::DFS: {
@@ -805,17 +812,28 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
         }
         case static_cast<int8_t>(ReplicaType::LOCAL_DISK): {
             const auto &payload = array_items[3];
+            // Accept the extended 5-element layout [client_id_str,
+            // object_size, transport_endpoint, record_offset, file_path]
+            // and the legacy 3-element layout (direct-read fields absent
+            // → defaults: record_offset = -1, file_path = "").
             if (payload.type != msgpack::type::ARRAY ||
-                payload.via.array.size != 3) {
+                (payload.via.array.size != 3 &&
+                 payload.via.array.size != 5)) {
                 return tl::unexpected(
                     SerializationError(ErrorCode::DESERIALIZE_FAIL,
                                        "deserialize_msgpack Replica LOCAL_DISK "
-                                       "payload is not valid array[3]"));
+                                       "payload is not valid array[3|5]"));
             }
             auto *payload_items = payload.via.array.ptr;
             std::string client_id_str = payload_items[0].as<std::string>();
             uint64_t object_size = payload_items[1].as<uint64_t>();
             std::string transport_endpoint = payload_items[2].as<std::string>();
+            int64_t record_offset = -1;
+            std::string file_path;
+            if (payload.via.array.size == 5) {
+                record_offset = payload_items[3].as<int64_t>();
+                file_path = payload_items[4].as<std::string>();
+            }
 
             UUID client_id;
             if (!StringToUuid(client_id_str, client_id)) {
@@ -827,7 +845,8 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
             }
 
             replica = std::make_shared<Replica>(
-                client_id, object_size, std::move(transport_endpoint), status);
+                client_id, object_size, std::move(transport_endpoint), status,
+                record_offset, std::move(file_path));
             break;
         }
         case static_cast<int8_t>(ReplicaType::DFS): {
