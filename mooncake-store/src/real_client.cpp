@@ -6961,75 +6961,136 @@ bool RealClient::can_use_pinned_restore_arena(
     }
     return has_data;
 }
+namespace {
+
+// One key served by the Phoenix direct-read fast path: user key plus the
+// destination slices, withheld from `objects` while the legacy path runs so
+// they are not re-fetched, then put back before the call returns.
+using DirectServedKeys =
+    std::vector<std::pair<std::string, std::vector<Slice>>>;
+
+// Puts the directly-served keys back into `objects` on EVERY exit path. Their
+// destination buffers have already been written by DMA, so the caller must see
+// them whether or not the legacy path that follows succeeds.
+struct DirectServedRestorer {
+    DirectServedKeys keys;
+    std::unordered_map<std::string, std::vector<Slice>> &objects;
+
+    ~DirectServedRestorer() {
+        for (auto &[k, v] : keys) objects.emplace(std::move(k), std::move(v));
+    }
+};
+
+#ifdef USE_PHOENIX
+// Try to serve `objects` from the local SSD via Phoenix DMA, bypassing the
+// RPC + CPU staging + transfer-engine hops. Only applicable when the disk
+// replica is owned by THIS process (embedded real client) and the destination
+// slices are Phoenix-registered and DMA-aligned. Servable keys are ERASED from
+// `objects` and returned; unservable/failed keys are left in `objects` for the
+// legacy path. Returns the list of directly-served keys (empty when the fast
+// path does not apply).
+DirectServedKeys PhoenixTryDirectRead(
+    const std::shared_ptr<FileStorage> &file_storage, Client *client,
+    const std::string &local_rpc_addr,
+    const std::string &target_rpc_service_addr,
+    std::unordered_map<std::string, std::vector<Slice>> &objects) {
+    DirectServedKeys direct_served;
+    if (!file_storage || target_rpc_service_addr != local_rpc_addr) {
+        return direct_served;
+    }
+    const TenantId direct_tenant(client->tenant_id());
+    // The backend indexes objects by tenant-scoped key; the direct path
+    // must plan with scoped keys, while `objects` keeps user keys.
+    std::unordered_map<std::string, std::vector<Slice>> direct_read_map;
+    std::unordered_map<std::string, std::vector<Slice>> candidate_slices;
+    for (auto it = objects.begin(); it != objects.end();) {
+        if (PhoenixCtx::Instance().has_registrations(it->second)) {
+            direct_read_map.emplace(direct_tenant.MakeScopedKey(it->first),
+                                    it->second);
+            candidate_slices.emplace(it->first, std::move(it->second));
+            it = objects.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (direct_read_map.empty()) return direct_served;
+
+    const size_t attempted = direct_read_map.size();
+    // BatchLoadDirect erases served (scoped) keys from direct_read_map.
+    // A failure is not fatal (leftovers just fall back to the legacy path),
+    // but the error code tells apart "not stored locally" (INVALID_PARAMS)
+    // from "phxfs read failed" (FILE_READ_FAIL), so keep it in the log.
+    auto load_result = file_storage->BatchLoadDirect(direct_read_map);
+    const size_t served = attempted - direct_read_map.size();
+    // Unserved leftovers: straight back to `objects` for the legacy
+    // path (TE reads into the same slices).
+    for (auto &[scoped_key, slices] : direct_read_map) {
+        auto [_, user_key] = TenantId::ParseScopedKey(scoped_key);
+        auto cs = candidate_slices.find(user_key);
+        if (cs != candidate_slices.end()) {
+            objects.emplace(user_key, std::move(cs->second));
+            candidate_slices.erase(cs);
+        } else {
+            // Unreachable: every scoped key was derived from a candidate.
+            // Dropping it here would make the enclosing call report success
+            // with a key missing from `objects`, so shout instead.
+            LOG(ERROR) << "Direct read leftover key has no candidate slices, "
+                          "key will be missing from the result: "
+                       << user_key;
+        }
+    }
+    // Served keys: hold them out of `objects` until the restorer runs.
+    for (auto &[user_key, slices] : candidate_slices) {
+        direct_served.emplace_back(user_key, std::move(slices));
+    }
+    if (served > 0) {
+        VLOG(1) << "Direct read served " << served << "/" << attempted
+                << " keys locally";
+    } else if (load_result) {
+        VLOG(1) << "Direct read unavailable, using legacy path";
+    } else {
+        VLOG(1) << "Direct read failed, using legacy path, error: "
+                << load_result.error();
+    }
+    return direct_served;
+}
+#else
+// Phoenix disabled at compile time: never serves anything.
+inline DirectServedKeys PhoenixTryDirectRead(
+    const std::shared_ptr<FileStorage> &, Client *, const std::string &,
+    const std::string &,
+    std::unordered_map<std::string, std::vector<Slice>> &) {
+    return {};
+}
+#endif  // USE_PHOENIX
+
+}  // namespace
 
 tl::expected<void, ErrorCode>
 RealClient::batch_get_into_offload_object_internal(
     const std::string &target_rpc_service_addr,
     std::unordered_map<std::string, std::vector<Slice>> &objects,
     const OffloadReadRange *read_range) {
+    // Phoenix same-host direct-read fast path. Serves what it can straight from
+    // local SSD into GPU memory and removes those keys from `objects`; the rest
+    // fall through to the legacy RPC path below.
+    DirectServedRestorer direct_served{
+        PhoenixTryDirectRead(file_storage_, client_.get(), local_rpc_addr,
+                             target_rpc_service_addr, objects),
+        objects};
+    if (objects.empty()) {
+        // Nothing left for the legacy path: either every key was served
+        // directly, or the caller handed us an empty batch. Either way there is
+        // no RPC to issue. The restorer refills `objects` on the way out.
+        return {};
+    }
+
+    // Counted and timed from here on: this is the RPC path proper, and
+    // `elapsed_time` is compared against the buffer lease (gc_ttl_ms) below, so
+    // it must not include the direct-read time.
     offload_rpc_read_count_.fetch_add(1, std::memory_order_relaxed);
     auto start_time = std::chrono::steady_clock::now();
-#ifdef USE_PHOENIX
-    // Keys served by the direct read path (below). They are restored into
-    // `objects` only on success, so the caller's contract ("on success
-    // `objects` holds every input key") is preserved.
-    std::vector<std::pair<std::string, std::vector<Slice>>> direct_served;
-    // Direct read fast path: when the disk replica is owned by THIS process
-    // (embedded real client), the destination slices are registered
-    // and DMA-aligned, read them straight from local SSD into GPU memory,
-    // skipping the RPC + CPU staging + transfer-engine hops. Keys that do
-    // not qualify (or fail) fall through to the legacy path below.
-    if (file_storage_ && target_rpc_service_addr == local_rpc_addr) {
-        const TenantId direct_tenant(client_->tenant_id());
-        // The backend indexes objects by tenant-scoped key; the direct path
-        // must plan with scoped keys, while `objects` keeps user keys.
-        std::unordered_map<std::string, std::vector<Slice>> direct_read_map;
-        std::unordered_map<std::string, std::vector<Slice>> candidate_slices;
-        for (auto it = objects.begin(); it != objects.end();) {
-            if (PhoenixCtx::Instance().has_registrations(it->second)) {
-                direct_read_map.emplace(direct_tenant.MakeScopedKey(it->first),
-                                        it->second);
-                candidate_slices.emplace(it->first, std::move(it->second));
-                it = objects.erase(it);
-            } else {
-                ++it;
-            }
-        }
-        if (!direct_read_map.empty()) {
-            const size_t attempted = direct_read_map.size();
-            // BatchLoadDirect erases served (scoped) keys from direct_read_map.
-            file_storage_->BatchLoadDirect(direct_read_map);
-            const size_t served = attempted - direct_read_map.size();
-            // Unserved leftovers: straight back to `objects` for the legacy
-            // path (TE reads into the same slices).
-            for (auto &[scoped_key, slices] : direct_read_map) {
-                auto [_, user_key] = TenantId::ParseScopedKey(scoped_key);
-                auto cs = candidate_slices.find(user_key);
-                if (cs != candidate_slices.end()) {
-                    objects.emplace(user_key, std::move(cs->second));
-                    candidate_slices.erase(cs);
-                }
-            }
-            // Served keys: defer restoration until this function succeeds.
-            for (auto &[user_key, slices] : candidate_slices) {
-                direct_served.emplace_back(user_key, std::move(slices));
-            }
-            if (served > 0) {
-                VLOG(1) << "Direct read served " << served << "/"
-                        << attempted << " keys locally";
-            } else {
-                VLOG(1) << "Direct read unavailable, using legacy path";
-            }
-            if (objects.empty()) {
-                // Everything was served directly: restore and finish.
-                for (auto &[k, v] : direct_served) {
-                    objects.emplace(std::move(k), std::move(v));
-                }
-                return {};
-            }
-        }
-    }
-#endif
+
     std::vector<std::string> keys;
     std::vector<std::string> storage_keys;
     std::vector<int64_t> sizes;
@@ -7130,13 +7191,6 @@ RealClient::batch_get_into_offload_object_internal(
     if (!local_batch && elapsed_time >= response->gc_ttl_ms) {
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
-    // Success: restore directly-served keys so the caller sees every input
-    // key present in `objects`.
-#ifdef USE_PHOENIX
-    for (auto &[k, v] : direct_served) {
-        objects.emplace(std::move(k), std::move(v));
-    }
-#endif
     return {};
 }
 
