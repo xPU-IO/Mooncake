@@ -15,9 +15,7 @@
 #ifdef USE_URING
 #include "file_interface.h"
 #endif
-#ifdef USE_PHOENIX
 #include "phoenix_gds.h"
-#endif
 
 namespace mooncake {
 
@@ -1005,7 +1003,6 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
     return {};
 }
 
-#ifdef USE_PHOENIX
 tl::expected<void, ErrorCode> FileStorage::BatchLoadDirect(
     std::unordered_map<std::string, std::vector<Slice>>& batched_objects) {
     auto start_time = std::chrono::steady_clock::now();
@@ -1064,7 +1061,6 @@ tl::expected<void, ErrorCode> FileStorage::BatchLoadDirect(
     }
     return {};
 }
-#endif
 
 tl::expected<void, ErrorCode> FileStorage::BatchLoad(
     std::unordered_map<std::string, Slice>& batch_object) {

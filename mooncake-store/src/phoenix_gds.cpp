@@ -1,46 +1,66 @@
 #include "phoenix_gds.h"
 
+#include <glog/logging.h>
+#include <unistd.h>
+
+#include <cerrno>
+
+#include "environ.h"
+
 #ifdef USE_PHOENIX
 
-#include <glog/logging.h>
-
 #include <algorithm>
-#include <cerrno>
 #include <cstring>
-#include <unistd.h>
 
 #include <phoenix.h>
 
 #include "cuda_alike.h"
 
-namespace mooncake {
+#endif  // USE_PHOENIX
 
-namespace {
-// libphoenix registration constraints.
-constexpr uint64_t kRegAlign = 64 * 1024;             // addr/len alignment
-constexpr uint64_t kMaxRegChunk = 32ULL * 1024 * 1024 * 1024;  // 32 GiB
-}  // namespace
+namespace mooncake {
 
 PhoenixCtx& PhoenixCtx::Instance() {
     static PhoenixCtx ctx;
     return ctx;
 }
 
-bool PhoenixCtx::module_present() const {
-    std::call_once(module_check_flag_, [this] {
+// The single gate: build capability AND runtime opt-out AND kernel module.
+// Probed once per process; a process that loads phxfs after startup is not
+// noticed (switch legs with the env var, not with insmod/rmmod).
+bool PhoenixCtx::enabled() const {
+    std::call_once(enabled_flag_, [this] {
+#ifdef USE_PHOENIX
+        // Check the env FIRST so a disabled process does no ::access and takes
+        // no other Phoenix-specific action at all — the "off" leg must behave
+        // exactly like a build without libphoenix.
+        if (!Environ::GetBool("MOONCAKE_PHOENIX_DIRECT_IO", true)) {
+            LOG(INFO) << "Phoenix: direct read disabled by "
+                         "MOONCAKE_PHOENIX_DIRECT_IO";
+            return;
+        }
         // phxfs creates one char device per GPU: /dev/phxfs_dev<N>.
-        module_present_ = (::access("/dev/phxfs_dev0", F_OK) == 0);
-        if (!module_present_) {
+        enabled_ = (::access("/dev/phxfs_dev0", F_OK) == 0);
+        if (!enabled_) {
             LOG(INFO) << "Phoenix: phxfs module not present "
                          "(/dev/phxfs_dev0 missing); direct read disabled";
         }
+#endif
     });
-    return module_present_;
+    return enabled_;
 }
+
+#ifdef USE_PHOENIX
+
+namespace {
+// libphoenix registration constraints.
+constexpr uint64_t kRegAlign = 64 * 1024;  // addr/len alignment
+constexpr uint64_t kMaxRegChunk = 32ULL * 1024 * 1024 * 1024;  // 32 GiB
+}  // namespace
 
 bool PhoenixCtx::staging_mode() const {
     std::call_once(staging_check_flag_, [this] {
-        if (!module_present()) return;
+        if (!enabled()) return;
         int mode = phxfs_get_map_mode(0);
         staging_mode_ = (mode == 1);  // PHX_MAP_MODE_STAGING
         if (staging_mode_) {
@@ -52,7 +72,7 @@ bool PhoenixCtx::staging_mode() const {
 }
 
 bool PhoenixCtx::has_registrations(const std::vector<Slice>& slices) const {
-    if (!module_present()) return false;
+    if (!enabled()) return false;
     if (staging_mode()) return true;
     std::shared_lock lock(mu_);
     if (regs_.empty()) return false;
@@ -121,7 +141,7 @@ int PhoenixCtx::ResolveDevice(uintptr_t addr, size_t len) {
 }
 
 int PhoenixCtx::Register(uintptr_t addr, size_t len) {
-    if (!module_present()) return -ENODEV;
+    if (!enabled()) return -ENODEV;
     if (staging_mode()) {
         // Staging mode: no registration needed, but open the device to
         // trigger staging pool setup on first use — and cache the extent so
@@ -357,7 +377,7 @@ int PhxReadBatch(const std::vector<DirectIoItem>& items,
                  std::vector<char>& done) {
     done.assign(items.size(), 0);
     if (items.empty()) return 0;
-    if (!PhoenixCtx::Instance().module_present()) return -ENODEV;
+    if (!PhoenixCtx::Instance().enabled()) return -ENODEV;
 
     std::vector<phxfs_io_req_t> reqs;
     std::vector<size_t> idx;
@@ -384,7 +404,7 @@ struct PhxAsyncReadBatch {
 PhxAsyncReadBatch* PhxAsyncReadBatchSubmit(
     const std::vector<DirectIoItem>& items) {
     if (items.empty()) return nullptr;
-    if (!PhoenixCtx::Instance().module_present()) return nullptr;
+    if (!PhoenixCtx::Instance().enabled()) return nullptr;
 
     auto* batch = new PhxAsyncReadBatch();
     BuildDirectReqs(items, batch->reqs, batch->idx);
@@ -423,7 +443,7 @@ int PhxWriteBatch(const std::vector<DirectIoItem>& items,
                   std::vector<char>& done) {
     done.assign(items.size(), 0);
     if (items.empty()) return 0;
-    if (!PhoenixCtx::Instance().module_present()) return -ENODEV;
+    if (!PhoenixCtx::Instance().enabled()) return -ENODEV;
 
     std::vector<phxfs_io_req_t> reqs;
     std::vector<size_t> idx;
@@ -450,7 +470,7 @@ struct PhxAsyncWriteBatch {
 PhxAsyncWriteBatch* PhxAsyncWriteBatchSubmit(
     const std::vector<DirectIoItem>& items) {
     if (items.empty()) return nullptr;
-    if (!PhoenixCtx::Instance().module_present()) return nullptr;
+    if (!PhoenixCtx::Instance().enabled()) return nullptr;
 
     auto* batch = new PhxAsyncWriteBatch();
     BuildDirectReqs(items, batch->reqs, batch->idx);
@@ -484,6 +504,69 @@ void PhxAsyncWriteBatchCancel(PhxAsyncWriteBatch* batch) {
     delete batch;
 }
 
-}  // namespace mooncake
+#else  // !USE_PHOENIX
+
+// Built without libphoenix. enabled() above is hard-wired to false, so nothing
+// here is reached through a normal call path; the bodies exist only so the rest
+// of mooncake_store can call these entry points without an #ifdef, which is
+// what keeps flipping STORE_USE_PHOENIX from recompiling the world.
+//
+// The PhxAsync*Batch structs stay undefined (the header only forward-declares
+// them): Submit always returns nullptr here, so Wait/Cancel can only ever be
+// handed a null pointer and never dereference one.
+
+bool PhoenixCtx::staging_mode() const { return false; }
+
+bool PhoenixCtx::has_registrations(const std::vector<Slice>&) const {
+    return false;
+}
+
+int PhoenixCtx::OpenDevice(int) { return -ENODEV; }
+
+int PhoenixCtx::ResolveDevice(uintptr_t, size_t) { return -1; }
+
+int PhoenixCtx::Register(uintptr_t, size_t) { return -ENODEV; }
+
+int PhoenixCtx::Unregister(uintptr_t, size_t) { return 0; }
+
+int PhoenixCtx::FindRegistration(uintptr_t, size_t, uintptr_t*) const {
+    return -1;
+}
+
+int PhxReadBatch(const std::vector<DirectIoItem>& items,
+                 std::vector<char>& done) {
+    done.assign(items.size(), 0);
+    return -ENODEV;
+}
+
+PhxAsyncReadBatch* PhxAsyncReadBatchSubmit(const std::vector<DirectIoItem>&) {
+    return nullptr;
+}
+
+int PhxAsyncReadBatchWait(PhxAsyncReadBatch*, std::vector<char>& done) {
+    done.clear();
+    return -ENODEV;
+}
+
+void PhxAsyncReadBatchCancel(PhxAsyncReadBatch*) {}
+
+int PhxWriteBatch(const std::vector<DirectIoItem>& items,
+                  std::vector<char>& done) {
+    done.assign(items.size(), 0);
+    return -ENODEV;
+}
+
+PhxAsyncWriteBatch* PhxAsyncWriteBatchSubmit(const std::vector<DirectIoItem>&) {
+    return nullptr;
+}
+
+int PhxAsyncWriteBatchWait(PhxAsyncWriteBatch*, std::vector<char>& done) {
+    done.clear();
+    return -ENODEV;
+}
+
+void PhxAsyncWriteBatchCancel(PhxAsyncWriteBatch*) {}
 
 #endif  // USE_PHOENIX
+
+}  // namespace mooncake

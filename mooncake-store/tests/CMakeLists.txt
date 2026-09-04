@@ -180,6 +180,17 @@ add_store_test(master_service_test_for_snapshot
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
 add_store_test(nvme_kv_storage_backend_test nvme_kv_storage_backend_test.cpp)
 add_store_test(storage_backend_test storage_backend_test.cpp)
+# PhoenixCtx::enabled() caches its answer once per process, so the "direct path
+# switched off" case needs a process of its own rather than a ::setenv in the
+# body. Same pattern as replica_selection_env_opt_in_test above.
+add_test(
+  NAME phoenix_direct_io_off_test
+  COMMAND
+    storage_backend_test
+    "--gtest_filter=StorageBackendTest.OffsetAllocatorStorageBackend_PhoenixSwitchOff"
+)
+set_tests_properties(phoenix_direct_io_off_test
+                     PROPERTIES ENVIRONMENT "MOONCAKE_PHOENIX_DIRECT_IO=0")
 add_store_test(client_storage_backend_test client_storage_backend_test.cpp)
 add_store_test(object_storage_adapter_test object_storage_adapter_test.cpp)
 add_store_test(mutex_test mutex_test.cpp)

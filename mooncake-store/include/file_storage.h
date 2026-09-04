@@ -83,8 +83,8 @@ class FileStorage {
 
     /**
      * @brief Direct-read keys from local SSD into their destination slices
-     * via Phoenix DMA (STORE_USE_PHOENIX builds only), bypassing the CPU
-     * staging buffer.
+     * via Phoenix DMA, bypassing the CPU staging buffer. A no-op returning
+     * FILE_READ_FAIL unless the Phoenix runtime switch is on.
      *
      * @param batched_objects In/out map of key -> destination Slices (each
      * must lie inside a Phoenix-registered GPU range and satisfy DMA
@@ -94,11 +94,8 @@ class FileStorage {
      * @return tl::expected<void, ErrorCode>; an error means nothing was read
      * (map left untouched).
      */
-#ifdef USE_PHOENIX
     tl::expected<void, ErrorCode> BatchLoadDirect(
-        std::unordered_map<std::string, std::vector<Slice>>&
-            batched_objects);
-#endif
+        std::unordered_map<std::string, std::vector<Slice>>& batched_objects);
 
     FileStorageConfig config_;
 

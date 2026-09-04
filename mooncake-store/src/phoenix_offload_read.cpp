@@ -2,13 +2,12 @@
 
 #include "phoenix_offload_read.h"
 
-#ifdef USE_PHOENIX
-
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -73,6 +72,12 @@ bool PlanOne(const DirectReadCandidate& cand, int& fd_out,
     int fd = GetDirectFd(desc.file_path);
     if (fd < 0) return false;
 
+    // ponytail: hardcodes the offset-allocator v3 record layout. Safe today
+    // only because that backend is the sole producer of a non-empty file_path
+    // (storage_backend.cpp:5096-5099, :5528) — every other backend passes "",
+    // and PlanOne rejects those above. A new backend that fills file_path with
+    // a different layout would compute the wrong offset and read garbage here.
+    // Tag the layout in the descriptor if that ever happens.
     const uint64_t value_offset =
         static_cast<uint64_t>(desc.record_offset) +
         OffsetAllocatorStorageBackend::RecordHeader::ValueOffsetInRecord(
@@ -99,11 +104,11 @@ void ServeDirectReads(const std::vector<DirectReadCandidate>& candidates,
     served.assign(candidates.size(), false);
     if (candidates.empty()) return;
 
-    // Guard: if the phxfs kernel module is not loaded, Phoenix DMA reads
-    // cannot be served even though the descriptor carries file_path (the
-    // file exists but there is no DMA engine to drive it). Fall back to the
-    // legacy RPC path. This check is cached (module_present() probes once).
-    if (!PhoenixCtx::Instance().module_present()) return;
+    // Guard: when the direct path is disabled (env off, phxfs module absent,
+    // or not built with libphoenix) we cannot serve DMA reads even though the
+    // descriptor carries file_path (the file exists but there is no DMA engine
+    // to drive it). Fall back to the legacy RPC path. Cached, probed once.
+    if (!PhoenixCtx::Instance().enabled()) return;
 
     std::vector<DirectIoItem> items;
     // Per-candidate item range [begin, end) within items.
@@ -133,8 +138,24 @@ void ServeDirectReads(const std::vector<DirectReadCandidate>& candidates,
 
     if (items.empty()) return;
 
+    // Time the DMA itself, excluding planning/admission above. Mirrors
+    // FileStorage::BatchLoadDirect's log (file_storage.cpp:1130) so the
+    // same-process and cross-process paths are measurable the same way.
+    // Without this, the only observable read latency includes the master
+    // GetReplicaList round-trip, which makes device throughput impossible
+    // to separate from control-plane cost.
+    const auto dma_start = std::chrono::steady_clock::now();
+
     std::vector<char> done(items.size(), 0);
     PhxReadBatch(items, done);
+
+    const auto dma_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - dma_start)
+                            .count();
+    uint64_t dma_bytes = 0;
+    for (const auto& it : items) dma_bytes += it.nbytes;
+    VLOG(1) << "phoenix_direct_read_dma: " << dma_us << "us, " << items.size()
+            << " items, " << dma_bytes << " bytes";
 
     for (size_t i = 0; i < candidates.size(); ++i) {
         const size_t begin = ranges[i].first;
@@ -156,5 +177,3 @@ void ServeDirectReads(const std::vector<DirectReadCandidate>& candidates,
 
 }  // namespace phoenix_offload
 }  // namespace mooncake
-
-#endif  // USE_PHOENIX
