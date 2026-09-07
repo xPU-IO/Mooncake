@@ -23,6 +23,8 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocator.h"
+#include "environ.h"
+#include "phoenix_gds.h"
 #include "utils.h"
 #include "utils/common.h"
 
@@ -1285,6 +1287,62 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_BasicPutGet) {
         std::string loaded(static_cast<char*>(it->second.ptr), it->second.size);
         EXPECT_EQ(loaded, expected_value);
     }
+}
+
+//-----------------------------------------------------------------------------
+
+// Regression guard for the Phoenix runtime switch: with
+// MOONCAKE_PHOENIX_DIRECT_IO=0 the offset-allocator backend must stay on the
+// legacy path. Init still succeeds, no O_DIRECT fd is opened, so BatchReadPlan
+// yields an empty plan and every read falls back to BatchLoad.
+//
+// The switch has to be set in the process environment before this test runs,
+// because PhoenixCtx::enabled() caches its answer once per process — a
+// ::setenv inside the body would be too late if any earlier test already asked.
+// That is why tests/CMakeLists.txt registers this case as its own ctest entry
+// with ENVIRONMENT set.
+TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_PhoenixSwitchOff) {
+    // Default run (switch unset, i.e. on): skip. This case is exercised by the
+    // dedicated phoenix_direct_io_off_test entry.
+    if (Environ::GetBool("MOONCAKE_PHOENIX_DIRECT_IO", true)) {
+        GTEST_SKIP() << "needs MOONCAKE_PHOENIX_DIRECT_IO=0 in the environment";
+    }
+    // The switch is off, so the gate must agree — otherwise every assertion
+    // below would be measuring the direct path it is meant to switch off.
+    ASSERT_FALSE(PhoenixCtx::Instance().enabled())
+        << "PhoenixCtx::enabled() ignores MOONCAKE_PHOENIX_DIRECT_IO";
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    config.total_size_limit = 100 * 1024 * 1024;  // 100MB
+    config.total_keys_limit = 10000;
+
+    OffsetAllocatorStorageBackend storage_backend(config);
+    ASSERT_TRUE(storage_backend.Init())
+        << "the backend must still initialise with the direct path off";
+
+    // Offload one 4 KiB object so the key below is genuinely resolvable: an
+    // empty plan is then caused by the switch, not by a missing key. 4 KiB
+    // keeps the length half of BatchReadPlan's DMA alignment check satisfiable.
+    const std::string key = "phx_off_key";
+    std::string value(4096, 'x');
+    auto buf = std::make_unique<char[]>(value.size());
+    std::memcpy(buf.get(), value.data(), value.size());
+    std::unordered_map<std::string, std::vector<Slice>> batch_object;
+    batch_object.emplace(key,
+                         std::vector<Slice>{Slice{buf.get(), value.size()}});
+
+    auto offload_res = storage_backend.BatchOffload(
+        batch_object,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(offload_res);
+
+    auto plan = storage_backend.BatchReadPlan(batch_object);
+    ASSERT_TRUE(plan.has_value());
+    EXPECT_TRUE(plan->empty())
+        << "direct path off => no O_DIRECT fd => reads fall back to BatchLoad";
 }
 
 //-----------------------------------------------------------------------------

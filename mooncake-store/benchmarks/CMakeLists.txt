@@ -68,6 +68,13 @@ target_link_libraries(uring_batch_read_bench PRIVATE mooncake_store)
 # pattern as mooncake_store's D2H staging; without it the mode stays
 # unavailable.
 if(STORE_USE_PHOENIX)
+  # The bench is the --phoenix A/B harness and keeps its own #ifdef
+  # USE_PHOENIX (it is the one target that legitimately must rebuild when the
+  # flag flips). mooncake_store no longer propagates the definition or the
+  # libphoenix include dir to its consumers, so they are set here instead.
+  target_compile_definitions(storage_backend_bench PRIVATE USE_PHOENIX)
+  target_include_directories(storage_backend_bench
+                             PRIVATE ${PHOENIX_INCLUDE_DIR})
   find_package(CUDAToolkit QUIET)
   if(CUDAToolkit_FOUND)
     target_link_libraries(storage_backend_bench PRIVATE CUDA::cudart)

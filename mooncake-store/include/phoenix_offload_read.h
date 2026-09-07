@@ -11,8 +11,7 @@
 //
 // Everything here is additive: candidates that cannot be served are reported
 // false and the caller falls back to the original endpoint-grouped RPC path.
-
-#ifdef USE_PHOENIX
+// When the Phoenix runtime switch is off, every candidate reports false.
 
 #include <cstddef>
 #include <cstdint>
@@ -46,5 +45,3 @@ void ServeDirectReads(const std::vector<DirectReadCandidate>& candidates,
 
 }  // namespace phoenix_offload
 }  // namespace mooncake
-
-#endif  // USE_PHOENIX

@@ -42,10 +42,8 @@
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
-#ifdef USE_PHOENIX
 #include "phoenix_gds.h"
 #include "phoenix_offload_read.h"
-#endif
 #ifdef USE_ASCEND_DIRECT
 #include "acl/acl_rt.h"
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
@@ -789,20 +787,20 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
 #endif
 
-#ifdef USE_PHOENIX
-    // Phoenix GDS is opt-in at compile time (STORE_USE_PHOENIX=ON), but at
-    // runtime the phxfs kernel module may be intentionally absent — e.g. the
-    // "ssd" baseline leg of a benchmark comparison, or a deployment that only
-    // wants the Mooncake legacy path. Degrade gracefully: log a warning and
-    // skip Phoenix initialization; the legacy RPC + pread path handles all
-    // reads. GPU buffer registration is automatic when the module is present;
-    // when absent, register_buffer_internal() simply skips PhoenixCtx.
-    if (!PhoenixCtx::Instance().module_present()) {
-        LOG(WARNING) << "Phoenix: phxfs module not present "
-                        "(/dev/phxfs_dev0 missing); built with "
-                        "STORE_USE_PHOENIX=ON but degrading to legacy path";
+    // The Phoenix direct-read path is opt-in on two independent axes: the
+    // build must have found libphoenix, and MOONCAKE_PHOENIX_DIRECT_IO must
+    // not be disabled, and the phxfs kernel module must be present. Any of
+    // those missing is a normal, supported configuration — e.g. the baseline
+    // leg of a benchmark comparison, or a deployment that only wants the
+    // Mooncake legacy path. Degrade gracefully: warn and carry on; the legacy
+    // RPC + pread path handles all reads, and register_buffer_internal()
+    // simply skips PhoenixCtx.
+    if (!PhoenixCtx::Instance().enabled()) {
+        LOG(WARNING) << "Phoenix: direct read path inactive "
+                        "(MOONCAKE_PHOENIX_DIRECT_IO disabled, phxfs module "
+                        "absent, or built without libphoenix); using the "
+                        "legacy RPC + pread path";
     }
-#endif
 
     std::optional<std::string> device_name =
         ((rdma_devices.empty() || rdma_devices == "auto-discovery")
@@ -1153,23 +1151,16 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         if (!ssd_offload_path.empty()) {
             file_storage_config.storage_filepath = ssd_offload_path;
         }
-#ifdef USE_PHOENIX
-        if (file_storage_config.storage_backend_type !=
-            StorageBackendType::kOffsetAllocator) {
-            LOG(ERROR) << "Phoenix: STORE_USE_PHOENIX=ON requires "
-                          "offset_allocator_storage_backend; current type is "
-                       << static_cast<int>(
-                              file_storage_config.storage_backend_type);
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        }
         // Embedded mode runs one RealClient per worker process while all
         // workers share the same storage path. The offset-allocator backend
         // keeps its allocator state in-process, so sharing one kv_cache.data
         // makes workers hand out overlapping offsets and overwrite each
         // other's records (reads then fail key validation, FILE_READ_FAIL).
-        // Give each process a private subdirectory. The check above
-        // guarantees the backend is kOffsetAllocator here.
-        {
+        // Give each process a private subdirectory. This is a property of the
+        // offset-allocator backend, not of Phoenix — hence it is keyed on the
+        // backend type and applies with the direct path on or off.
+        if (file_storage_config.storage_backend_type ==
+            StorageBackendType::kOffsetAllocator) {
             namespace fs = std::filesystem;
             fs::path per_client_dir =
                 fs::path(file_storage_config.storage_filepath) /
@@ -1184,7 +1175,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             LOG(INFO) << "SSD offload using per-client dir: " << per_client_dir;
             file_storage_config.storage_filepath = per_client_dir.string();
         }
-#endif
         file_storage_ = std::make_shared<FileStorage>(
             file_storage_config, client_, this->local_rpc_addr,
             client_->GetSsdMetricPtr());
@@ -3437,10 +3427,10 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
     if (!result) {
         return result;
     }
-#ifdef USE_PHOENIX
-    PhoenixCtx::Instance().Register(reinterpret_cast<uintptr_t>(buffer),
-                                     size);
-#endif
+    if (PhoenixCtx::Instance().enabled()) {
+        PhoenixCtx::Instance().Register(reinterpret_cast<uintptr_t>(buffer),
+                                        size);
+    }
     {
         std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
         registered_buffer_sizes_[buffer] = size;
@@ -3464,8 +3454,7 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
                    << toString(unregister_result.error());
         return tl::unexpected(unregister_result.error());
     }
-#ifdef USE_PHOENIX
-    {
+    if (PhoenixCtx::Instance().enabled()) {
         std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
         auto it = registered_buffer_sizes_.find(buffer);
         if (it != registered_buffer_sizes_.end()) {
@@ -3473,7 +3462,6 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
                 reinterpret_cast<uintptr_t>(buffer), it->second);
         }
     }
-#endif
     {
         std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
         registered_buffer_sizes_.erase(buffer);
@@ -6365,15 +6353,16 @@ RealClient::batch_get_into_multi_buffers_internal(
                 std::unordered_map<std::string, std::vector<Slice>>>
                 offload_objects;
 
-#ifdef USE_PHOENIX
             // Phoenix same-host direct read: LOCAL_DISK replicas whose
             // descriptor carries the record's file location (record_offset +
             // file_path) are DMA-read straight from the local NVMe into the
             // user buffers, bypassing the owner-RPC staging path — including
             // replicas owned by other co-located worker processes. Unserved
             // keys fall through to the endpoint grouping below unchanged.
+            // Declared unconditionally: stays empty when the direct path is
+            // off, so the skip check below is a no-op.
             std::unordered_set<std::string> phx_direct_served;
-            {
+            if (PhoenixCtx::Instance().enabled()) {
                 std::vector<phoenix_offload::DirectReadCandidate> phx_cands;
                 std::vector<std::string> phx_keys;
                 std::vector<std::string> phx_scoped;
@@ -6443,13 +6432,10 @@ RealClient::batch_get_into_multi_buffers_internal(
                     }
                 }
             }
-#endif
 
             for (auto &[key, op] : valid_local_disk_ops) {
                 if (!op.is_local_disk) continue;
-#ifdef USE_PHOENIX
                 if (phx_direct_served.count(key) != 0) continue;
-#endif
                 const auto &replica = op.replica;
                 if (!replica.is_local_disk_replica()) {
                     LOG(ERROR)
@@ -6981,20 +6967,20 @@ struct DirectServedRestorer {
     }
 };
 
-#ifdef USE_PHOENIX
 // Try to serve `objects` from the local SSD via Phoenix DMA, bypassing the
 // RPC + CPU staging + transfer-engine hops. Only applicable when the disk
 // replica is owned by THIS process (embedded real client) and the destination
 // slices are Phoenix-registered and DMA-aligned. Servable keys are ERASED from
 // `objects` and returned; unservable/failed keys are left in `objects` for the
 // legacy path. Returns the list of directly-served keys (empty when the fast
-// path does not apply).
+// path does not apply, including when the direct path is switched off).
 DirectServedKeys PhoenixTryDirectRead(
     const std::shared_ptr<FileStorage> &file_storage, Client *client,
     const std::string &local_rpc_addr,
     const std::string &target_rpc_service_addr,
     std::unordered_map<std::string, std::vector<Slice>> &objects) {
     DirectServedKeys direct_served;
+    if (!PhoenixCtx::Instance().enabled()) return direct_served;
     if (!file_storage || target_rpc_service_addr != local_rpc_addr) {
         return direct_served;
     }
@@ -7054,15 +7040,6 @@ DirectServedKeys PhoenixTryDirectRead(
     }
     return direct_served;
 }
-#else
-// Phoenix disabled at compile time: never serves anything.
-inline DirectServedKeys PhoenixTryDirectRead(
-    const std::shared_ptr<FileStorage> &, Client *, const std::string &,
-    const std::string &,
-    std::unordered_map<std::string, std::vector<Slice>> &) {
-    return {};
-}
-#endif  // USE_PHOENIX
 
 }  // namespace
 

@@ -1,14 +1,26 @@
 #pragma once
 
-#ifdef USE_PHOENIX
-
-// Phoenix GDS direct-read support (STORE_USE_PHOENIX).
+// Phoenix GDS direct-read support.
 //
 // PhoenixCtx owns the phxfs device handles and the registry of GPU buffers
 // that direct DMA reads may target. It is deliberately storage-agnostic: the
 // storage backends hand us (fd, file offset) via DirectIoItem and Phoenix
 // turns them into phxfs_io_req_t batch reads straight into registered GPU
 // memory. No file management (layout/eviction/metadata) happens here.
+//
+// This header is always compilable — it names no libphoenix type, so flipping
+// the build flag does not recompile its consumers. Two independent axes decide
+// whether the direct path actually runs:
+//
+//   build capability : STORE_USE_PHOENIX / USE_PHOENIX — libphoenix was found
+//                      at build time, so the real implementation is linked in.
+//                      Only phoenix_gds.cpp is #ifdef'd on it.
+//   runtime enable   : MOONCAKE_PHOENIX_DIRECT_IO (default on) — whether this
+//                      process may use the direct path at all.
+//
+// enabled() is the single gate combining both. When it returns false every
+// entry point below degrades to a no-op and callers fall back to the legacy
+// RPC + pread path.
 
 #include <cstddef>
 #include <cstdint>
@@ -25,10 +37,11 @@ class PhoenixCtx {
    public:
     static PhoenixCtx& Instance();
 
-    // True when the phxfs kernel module is present (fast guard; cached at
-    // first call). Direct-read candidates still must pass
+    // The single gate for the whole direct path (cached at first call): built
+    // with libphoenix AND MOONCAKE_PHOENIX_DIRECT_IO not disabled AND the phxfs
+    // kernel module present. Direct-read candidates still must pass
     // FindRegistration()+alignment.
-    bool module_present() const;
+    bool enabled() const;
 
     // True when phxfs is in STAGING mode (cached at first call). In staging
     // mode libphoenix routes reads through an internal staging pool
@@ -38,8 +51,9 @@ class PhoenixCtx {
 
     // True when every slice lies inside a Phoenix-registered GPU range and
     // satisfies the DMA alignment rules (4 KiB offset within the registration,
-    // 512 B multiple length).  Returns false when module is absent or no
-    // buffer has been registered.  In staging mode returns true immediately.
+    // 512 B multiple length).  Returns false when the direct path is disabled
+    // or no buffer has been registered.  In staging mode returns true
+    // immediately.
     bool has_registrations(const std::vector<Slice>& slices) const;
 
     // Register an accelerator buffer range for Phoenix DMA.
@@ -109,8 +123,8 @@ class PhoenixCtx {
     };
     std::vector<DevReg> dev_cache_;
     std::unordered_map<int, int> dev_by_device_;  // vendor device id -> phxfs dev
-    mutable std::once_flag module_check_flag_;
-    mutable bool module_present_ = false;
+    mutable std::once_flag enabled_flag_;
+    mutable bool enabled_ = false;
     mutable std::once_flag staging_check_flag_;
     mutable bool staging_mode_ = false;
 };
@@ -120,7 +134,8 @@ class PhoenixCtx {
 // eligible ones, and marks per-item outcomes in done (done.size() ==
 // items.size(); entries for ineligible or failed items are false).
 // Returns 0 when the batch ran (inspect done for per-key results), negative
-// errno on submission-level failure (nothing was read).
+// errno on submission-level failure (nothing was read); in particular -ENODEV
+// when enabled() is false.
 int PhxReadBatch(const std::vector<DirectIoItem>& items,
                  std::vector<char>& done);
 
@@ -154,5 +169,3 @@ int PhxAsyncWriteBatchWait(PhxAsyncWriteBatch* batch,
 void PhxAsyncWriteBatchCancel(PhxAsyncWriteBatch* batch);
 
 }  // namespace mooncake
-
-#endif  // USE_PHOENIX

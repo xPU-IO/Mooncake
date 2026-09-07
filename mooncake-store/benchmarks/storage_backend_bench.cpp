@@ -100,6 +100,7 @@
 #include <phoenix.h>
 
 #include "device/accelerator_registry.h"
+#include "environ.h"
 #include "phoenix_gds.h"
 #endif
 
@@ -1345,6 +1346,17 @@ void BenchBatchLoad(BackendType type, const std::string& storage_path,
     }
 
 #if defined(USE_PHOENIX) && defined(USE_CUDA)
+    // --phoenix with the runtime switch off does not measure the direct path
+    // at all: every read falls back to the legacy path. That still terminates
+    // (Register fails with -ENODEV), so fail here with a message that names
+    // the actual cause instead of a bare "Register failed".
+    if (FLAGS_phoenix &&
+        !mooncake::Environ::GetBool("MOONCAKE_PHOENIX_DIRECT_IO", true)) {
+        LOG(ERROR) << "--phoenix requires MOONCAKE_PHOENIX_DIRECT_IO to be on; "
+                      "it is currently off, so no read would go through the "
+                      "direct path and the numbers would mean nothing";
+        return;
+    }
     // --phoenix: timed read goes SSD → GPU via BatchReadPlan + PhxReadBatch.
     // --h2d: after legacy BatchLoad (SSD→CPU), also H2D copy to GPU.
     void* gpu_buf = nullptr;

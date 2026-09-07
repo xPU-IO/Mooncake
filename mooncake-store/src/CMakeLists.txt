@@ -189,7 +189,17 @@ endif()
 
 list(APPEND MOONCAKE_STORE_MASTER_SOURCES k8s_lease_helper.cpp)
 
-# Phoenix GDS direct-read support (opt-in)
+# Phoenix GDS direct-read support.
+#
+# The sources below are ALWAYS compiled: phoenix_gds.cpp is the only
+# translation unit guarded on USE_PHOENIX (real implementation vs. no-op
+# stubs), and the Phoenix headers name no libphoenix type. That is what keeps
+# flipping this option from recompiling every consumer of storage_backend.h.
+# Whether the path actually runs is decided at runtime by
+# MOONCAKE_PHOENIX_DIRECT_IO — see PhoenixCtx::enabled().
+list(APPEND MOONCAKE_STORE_CLIENT_SOURCES phoenix_gds.cpp)
+list(APPEND MOONCAKE_STORE_CLIENT_SOURCES phoenix_offload_read.cpp)
+
 option(STORE_USE_PHOENIX "build mooncake store with Phoenix GDS direct read path" OFF)
 if(STORE_USE_PHOENIX)
   find_library(PHOENIX_LIB phoenix PATHS /usr/lib /usr/lib64 /usr/local/lib)
@@ -199,11 +209,10 @@ if(STORE_USE_PHOENIX)
       "Run 'make install' in the Phoenix build directory first.")
   endif()
   message(STATUS "Phoenix GDS: Enabled (${PHOENIX_LIB}, ${PHOENIX_INCLUDE_DIR})")
-  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES phoenix_gds.cpp)
-  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES phoenix_offload_read.cpp)
   list(APPEND EXTRA_LIBS ${PHOENIX_LIB})
 else()
-  message(STATUS "Phoenix GDS: Disabled (STORE_USE_PHOENIX=OFF)")
+  message(STATUS "Phoenix GDS: Disabled (STORE_USE_PHOENIX=OFF; "
+                 "the direct-read path compiles to no-op stubs)")
 endif()
 if(STORE_USE_K8S_LEASE)
   list(APPEND MOONCAKE_STORE_MASTER_SOURCES
@@ -523,14 +532,16 @@ if(USE_SUNRISE)
                            ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
 endif()
 if(STORE_USE_PHOENIX)
-  # USE_PHOENIX is referenced by public headers and downstream targets
-  # (store_py, benchmarks), hence PUBLIC on mooncake_store; the object
-  # library compiling the Phoenix sources needs it PRIVATE.
+  # phoenix_gds.cpp (the only TU that consumes these) is compiled in
+  # mooncake_store_client_objects. USE_PHOENIX no longer appears in any
+  # public header, so the definition and the libphoenix include dir are NOT
+  # propagated to mooncake_store's consumers — flipping this option does not
+  # recompile them. storage_backend_bench (the --phoenix A/B harness, the one
+  # target that legitimately must rebuild) gets its own copy in
+  # benchmarks/CMakeLists.txt.
   target_compile_definitions(mooncake_store_client_objects PRIVATE USE_PHOENIX)
   target_include_directories(mooncake_store_client_objects
                              PRIVATE ${PHOENIX_INCLUDE_DIR})
-  target_compile_definitions(mooncake_store PUBLIC USE_PHOENIX)
-  target_include_directories(mooncake_store PUBLIC ${PHOENIX_INCLUDE_DIR})
   get_filename_component(PHOENIX_LIB_DIR ${PHOENIX_LIB} DIRECTORY)
   set_target_properties(mooncake_store PROPERTIES
       BUILD_RPATH ${PHOENIX_LIB_DIR}

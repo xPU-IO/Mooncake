@@ -29,6 +29,7 @@
 #include "crc32c.h"
 #include "ascii_string.h"
 #include "environ.h"
+#include "phoenix_gds.h"
 
 #include <ylt/util/tl/expected.hpp>
 
@@ -3705,8 +3706,12 @@ OffsetAllocatorStorageBackend::OffsetAllocatorStorageBackend(
     capacity_ = file_storage_config_.total_size_limit;
 }
 
-#ifdef USE_PHOENIX
 void OffsetAllocatorStorageBackend::OpenDirectFd() {
+    // The one behavioural gate for the direct-read path in this backend: with
+    // the Phoenix runtime switch off we never open the extra fd, so
+    // BatchReadPlan's `direct_fd_.fd < 0` early-out keeps every read on the
+    // legacy BatchLoad path — byte-for-byte the pre-Phoenix behaviour.
+    if (!PhoenixCtx::Instance().enabled()) return;
     if (direct_fd_.fd >= 0 || data_file_path_.empty()) return;
     // Dedicated O_DIRECT fd for direct reads. Kept separate from
     // data_file_ so the legacy path is untouched; failure only disables
@@ -3722,7 +3727,6 @@ void OffsetAllocatorStorageBackend::OpenDirectFd() {
                   << data_file_path_;
     }
 }
-#endif
 
 OffsetAllocatorStorageBackend::~OffsetAllocatorStorageBackend() {
     try {
@@ -3893,9 +3897,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
                     std::memory_order_relaxed);
                 // The recovery path skips the fresh-start section below, so
                 // the Phoenix direct-read fd must be (re)opened here too.
-#ifdef USE_PHOENIX
                 OpenDirectFd();
-#endif
                 initialized_.store(true, std::memory_order_release);
                 LOG(INFO) << "OffsetAllocatorStorageBackend recovered: "
                           << total_keys_.load() << " keys, "
@@ -3967,9 +3969,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
             data_file_->SetDeleteOnWriteFail(false);
         }
 
-#ifdef USE_PHOENIX
         OpenDirectFd();
-#endif
 
         // Create allocator with tuned node capacity
         constexpr int64_t kMinObjectSize = 256;
@@ -5514,7 +5514,6 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
 
 //-----------------------------------------------------------------------------
 
-#ifdef USE_PHOENIX
 tl::expected<std::vector<DirectIoItem>, ErrorCode>
 OffsetAllocatorStorageBackend::BatchReadPlan(
     const std::unordered_map<std::string, std::vector<Slice>>&
@@ -5575,7 +5574,6 @@ OffsetAllocatorStorageBackend::BatchReadPlan(
     }
     return items;
 }
-#endif
 
 //-----------------------------------------------------------------------------
 

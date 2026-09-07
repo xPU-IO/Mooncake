@@ -387,8 +387,6 @@ struct FileStorageConfig {
     static FileStorageConfig FromEnvironment();
 };
 
-
-#ifdef USE_PHOENIX
 /// One direct I/O request: (fd, offset, size) for DMA read or write.
 struct DirectIoItem {
     std::string key;
@@ -398,7 +396,6 @@ struct DirectIoItem {
     Slice buf;                  // dest for read, src for write
     std::shared_ptr<void> pin;  // keeps extent/bucket alive during I/O
 };
-#endif
 
 class StorageBackendInterface {
    public:
@@ -413,14 +410,12 @@ class StorageBackendInterface {
 
     /// Resolve keys to (fd, offset) descriptors for direct DMA read.
     /// Default: empty (backend does not support direct read).
-#ifdef USE_PHOENIX
     virtual tl::expected<std::vector<DirectIoItem>, ErrorCode> BatchReadPlan(
         const std::unordered_map<std::string, std::vector<Slice>>&
             batched_objects) {
         (void)batched_objects;
         return std::vector<DirectIoItem>{};
     }
-#endif
 
     virtual tl::expected<int64_t, ErrorCode> BatchOffload(
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
@@ -1314,12 +1309,11 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) override;
 
-    /// v3 record layout keeps value 4 KiB aligned; only aligned records qualify.
-#ifdef USE_PHOENIX
+    /// v3 record layout keeps value 4 KiB aligned; only aligned records
+    /// qualify.
     tl::expected<std::vector<DirectIoItem>, ErrorCode> BatchReadPlan(
         const std::unordered_map<std::string, std::vector<Slice>>&
             batched_objects) override;
-#endif
 
     /**
      * @brief Checks whether an object with the specified key exists in the
@@ -1618,9 +1612,9 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     // RAII holder for the backend's dedicated O_RDONLY|O_DIRECT fd used by
     // direct reads. Opened once at Init (either path), closed
     // automatically with the backend. fd == -1 means "direct read
-    // unavailable" (open failed or USE_PHOENIX off) — BatchReadPlan then
-    // returns empty and every read falls back to BatchLoad.
-#ifdef USE_PHOENIX
+    // unavailable" (open failed, or the Phoenix runtime switch is off) —
+    // BatchReadPlan then returns empty and every read falls back to
+    // BatchLoad.
     struct DirectFd {
         int fd = -1;
         DirectFd() = default;
@@ -1641,10 +1635,10 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     };
     DirectFd direct_fd_;
 
-    // Opens direct_fd_ (idempotent). Called from both the fresh-start
-    // and the persistence-recovery paths of Init().
+    // Opens direct_fd_ (idempotent, and a no-op unless the Phoenix runtime
+    // switch is on). Called from both the fresh-start and the
+    // persistence-recovery paths of Init().
     void OpenDirectFd();
-#endif
 
     // Sharded metadata maps: one map per shard with its own lock (prevents data
     // races)
